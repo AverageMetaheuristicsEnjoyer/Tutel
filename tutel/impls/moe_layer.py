@@ -231,6 +231,25 @@ class MOELayer(torch.nn.Module):
 
         self.gates = ModuleList(self.gates)
 
+        self.is_moge = False
+        self.num_groups = 0
+        self.top_k_per_group = 0
+        if len(self.gates) > 0:
+            first_gate_config = gate_type[0] # Assuming gate_type was a list
+            if first_gate_config.get('is_moge', False):
+                self.is_moge = True
+                self.num_groups = first_gate_config.get('num_groups', -1)
+                if self.num_groups <= 0:
+                    raise ValueError("num_groups must be a positive integer for MoGE mode.")
+                
+                if self.num_global_experts % self.num_groups != 0:
+                    raise ValueError(f"num_global_experts ({self.num_global_experts}) must be divisible by num_groups ({self.num_groups}).")
+                
+                # We will use the gate's top_k as the k *per group*
+                self.top_k_per_group = self.gates[0].top_k
+                self.experts_per_group = self.num_global_experts // self.num_groups
+                logging.info(f"Tutel MOELayer configured in MoGE mode with {self.num_groups} groups and top-{self.top_k_per_group} selection per group.")
+
         if seeds is not None and len(seeds) > 2 and seeds[2] is not None:
             torch.manual_seed(seeds[2])
 
@@ -289,7 +308,35 @@ class MOELayer(torch.nn.Module):
             else:
                 logits_w_noise = logits
 
-            scores = F.softmax(logits_w_noise, dim=1)
+            if self.is_moge:
+                # Pangu-style Grouped Top-K routing
+                scores_original = F.softmax(logits_w_noise, dim=1)
+                num_tokens = scores_original.shape[0]
+
+                # Reshape for grouping
+                grouped_scores = scores_original.view(num_tokens, self.num_groups, self.experts_per_group)
+
+                # Get top-k per group (for now, we assume k=1 as in Pangu)
+                _, selected_local_experts_per_group = torch.topk(grouped_scores, k=self.top_k_per_group, dim=-1)
+
+                # Calculate global expert indices
+                group_offsets = torch.arange(0, self.num_global_experts, self.experts_per_group, device=x.device, dtype=torch.long).unsqueeze(0)
+                selected_global_experts = selected_local_experts_per_group + group_offsets.unsqueeze(-1)
+                
+                # Create a mask to force Tutel's router to pick our experts
+                # Flatten the selected expert indices for one_hot
+                selected_global_experts_flat = selected_global_experts.view(num_tokens, -1)
+                mask = F.one_hot(selected_global_experts_flat, num_classes=self.num_global_experts).sum(dim=1)
+                
+                # Apply the mask to the original scores
+                scores = scores_original * mask.float()
+                
+                # The new top_k for the global router is the total number of experts per token
+                effective_top_k = self.num_groups * self.top_k_per_group
+            else:
+                scores = F.softmax(logits_w_noise, dim=1)
+                effective_top_k = top_k            
+
             if self.is_gshard_loss:
                 _loss_fn = lambda gates, topk_ids: losses.gshard_loss(gates, topk_ids)
             else:
@@ -303,7 +350,7 @@ class MOELayer(torch.nn.Module):
                 alignment = (alignment + 127) // 128 * 128
 
             return logits.dtype, extract_critical(scores,
-                top_k = top_k,
+                top_k = effective_top_k,
                 loss_fn = _loss_fn,
                 capacity_factor = capacity_factor or gctx.capacity_factor,
                 batch_prioritized_routing = self.batch_prioritized_routing,
