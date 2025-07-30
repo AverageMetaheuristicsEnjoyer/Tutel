@@ -205,6 +205,25 @@ class MOELayer(torch.nn.Module):
         if not isinstance(gate_type, list):
             gate_type = [gate_type]
 
+        # First, check for MoGE configuration from the first gate's config dict
+        first_gate_config = gate_type[0]
+        self.is_moge = first_gate_config.get('is_moge', False)
+        
+        if self.is_moge:
+            self.num_groups = first_gate_config.get('num_groups', -1)
+            if self.num_groups <= 0:
+                raise ValueError("num_groups must be a positive integer for MoGE mode.")
+            if self.num_global_experts % self.num_groups != 0:
+                raise ValueError(f"num_global_experts ({self.num_global_experts}) must be divisible by num_groups ({self.num_groups}).")
+            
+            # In MoGE mode, the gate's top_k is interpreted as k *per group*
+            self.top_k_per_group = first_gate_config.get('k', 1)
+            self.experts_per_group = self.num_global_experts // self.num_groups
+            logging.info(f"Tutel MOELayer configured in MoGE mode with {self.num_groups} groups and top-{self.top_k_per_group} selection per group.")
+        else:
+            self.num_groups = 0
+            self.top_k_per_group = 0
+
         self.gates = []
         for gi, single_gate_type in enumerate(gate_type):
             gate_type = single_gate_type.pop('type')
@@ -230,25 +249,6 @@ class MOELayer(torch.nn.Module):
             self.gates += [gate_module]
 
         self.gates = ModuleList(self.gates)
-
-        self.is_moge = False
-        self.num_groups = 0
-        self.top_k_per_group = 0
-        if len(self.gates) > 0:
-            first_gate_config = gate_type[0] # Assuming gate_type was a list
-            if first_gate_config.get('is_moge', False):
-                self.is_moge = True
-                self.num_groups = first_gate_config.get('num_groups', -1)
-                if self.num_groups <= 0:
-                    raise ValueError("num_groups must be a positive integer for MoGE mode.")
-                
-                if self.num_global_experts % self.num_groups != 0:
-                    raise ValueError(f"num_global_experts ({self.num_global_experts}) must be divisible by num_groups ({self.num_groups}).")
-                
-                # We will use the gate's top_k as the k *per group*
-                self.top_k_per_group = self.gates[0].top_k
-                self.experts_per_group = self.num_global_experts // self.num_groups
-                logging.info(f"Tutel MOELayer configured in MoGE mode with {self.num_groups} groups and top-{self.top_k_per_group} selection per group.")
 
         if seeds is not None and len(seeds) > 2 and seeds[2] is not None:
             torch.manual_seed(seeds[2])
