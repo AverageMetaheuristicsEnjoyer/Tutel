@@ -302,46 +302,63 @@ class MOELayer(torch.nn.Module):
         def routing():
             logits = gctx(x)
 
+            if gctx.use_penalty and self.training:
+                penalty = gctx.avg_logits.unsqueeze(0) * gctx.srome_alpha
+                balanced_logits = logits - penalty
+                logits_for_routing = balanced_logits
+                
+                with torch.no_grad():
+                    router_probs_for_balance = F.softmax(logits.float(), dim=-1)
+                    mean_batch_probs = torch.mean(router_probs_for_balance, dim=0)
+                    gctx.avg_logits.mul_(gctx.srome_beta)
+                    gctx.avg_logits.add_(mean_batch_probs.detach(), alpha=1.0 - gctx.srome_beta)
+            else:
+                logits_for_routing = logits
+
             if self.training and gctx.gate_noise > 0:
                 logits_w_noise = logits + gctx.gate_noise * torch.randn_like(logits) / self.num_global_experts
             else:
                 logits_w_noise = logits
 
+            scores_for_selection = F.softmax(logits_w_noise, dim=1)
+            scores_for_loss = F.softmax(logits, dim=1)
+
             if self.is_moge:
-                # Pangu-style Grouped Top-K routing
-                scores_original = F.softmax(logits_w_noise, dim=1)
-                num_tokens = scores_original.shape[0]
-
-                # Reshape for grouping
-                grouped_scores = scores_original.view(num_tokens, self.num_groups, self.experts_per_group)
-
-                # Get top-k per group (for now, we assume k=1 as in Pangu)
+                num_tokens = scores_for_selection.shape[0]
+                grouped_scores = scores_for_selection.view(num_tokens, self.num_groups, self.experts_per_group)
                 _, selected_local_experts_per_group = torch.topk(grouped_scores, k=self.top_k_per_group, dim=-1)
-
-                # Calculate global expert indices
                 group_offsets = torch.arange(0, self.num_global_experts, self.experts_per_group, device=x.device, dtype=torch.long).unsqueeze(0)
                 selected_global_experts = selected_local_experts_per_group + group_offsets.unsqueeze(-1)
-                
-                # Create a mask to force Tutel's router to pick our experts
-                # Flatten the selected expert indices for one_hot
                 selected_global_experts_flat = selected_global_experts.view(num_tokens, -1)
                 mask = F.one_hot(selected_global_experts_flat, num_classes=self.num_global_experts).sum(dim=1)
                 
-                # Apply the mask to the original scores
-                scores = scores_original * mask.float()
-                
-                # The new top_k for the global router is the total number of experts per token
+                scores = scores_for_selection * mask.float()
                 effective_top_k = self.num_groups * self.top_k_per_group
             else:
-                scores = F.softmax(logits_w_noise, dim=1)
-                effective_top_k = top_k            
+                scores = scores_for_selection
+                effective_top_k = top_k
 
             if self.is_gshard_loss:
-                _loss_fn = lambda gates, topk_ids: losses.gshard_loss(gates, topk_ids)
+                # The lambda now calls our augmented gshard_loss
+                _loss_fn = lambda gates, topk_ids: losses.gshard_loss(
+                    scores_w_noise=gates,
+                    top_ids=topk_ids,
+                    # Pass PIS arguments if needed
+                    use_pis=gctx.use_pis,
+                    router_probs=scores_for_loss,
+                    top_k_scores=gates, # `gates` in this context are the top-k scores
+                    num_groups=self.num_groups,
+                    experts_per_group=self.experts_per_group,
+                    lambda1=gctx.srome_lambda1,
+                    lambda2=gctx.srome_lambda2,
+                )
             else:
                 _loss_fn = lambda gates, topk_ids: losses.load_importance_loss(
-                    F.softmax(logits, dim=1), logits_w_noise.gather(index=topk_ids, dim=1),
-                    self.num_global_experts, gctx.gate_noise)
+                    scores_wo_noise=scores_for_loss, 
+                    topk_logits=logits_w_noise.gather(index=topk_ids, dim=1),
+                    num_global_experts=self.num_global_experts, 
+                    gate_noise=gctx.gate_noise
+                )
 
             mega_up = max(megablocks_size, 1)
             alignment = (self.sharded_count * a2a_ffn_overlap_degree + mega_up - 1) // mega_up * mega_up
