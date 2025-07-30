@@ -24,13 +24,6 @@ class LinearTopKGate(torch.nn.Module):
 
         if self.use_penalty:
             self.register_buffer("avg_logits", torch.zeros(num_global_experts))
-        
-        logging.info("="*50)
-        logging.info(f"[DEBUG] Rank {torch.distributed.get_rank()}: LinearTopKGate received options:")
-        import json
-        logging.info(json.dumps(options, indent=2))
-        logging.info("="*50)
-
         for opt in options:
             if opt not in ('capacity_factor', 'gate_noise'):
                 raise Exception('Unrecognized argument provided to Gating module: %s' % opt)
