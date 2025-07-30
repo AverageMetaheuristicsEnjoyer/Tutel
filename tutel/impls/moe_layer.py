@@ -145,14 +145,12 @@ class MOELayer(torch.nn.Module):
             raise Exception('Unrecognized parallel type specified: %s' % parallel_type)
 
         self.model_dim = model_dim
-
         self.is_postscore = is_postscore
         self.batch_prioritized_routing = batch_prioritized_routing
         if int(os.environ.get('BATCH_PRIO', 0)) != 0:
             self.batch_prioritized_routing = True
         self.normalize_gate = normalize_gate
         self.is_gshard_loss = is_gshard_loss
-
         self.a2a_ffn_overlap_degree = a2a_ffn_overlap_degree
         self.use_2dh = use_2dh
 
@@ -171,11 +169,6 @@ class MOELayer(torch.nn.Module):
                 fused_experts = importlib.import_module(f'...experts.{experts_type}', __name__)
             except ModuleNotFoundError:
                 raise Exception('Builtin expert type is not recognized: %s' % experts_type)
-
-            if experts_type == 'ffn':
-                assert 'fused_custom_fn' not in experts, "`fused_custom_fn` option for Tutel Moe-layer has been deprecated, please follows helloworld_from_scratch.py for custom construction instead."
-                assert 'implicit_dropout_p' not in experts, "`implicit_dropout_p` option for Tutel Moe-layer has been deprecated, please use torch.nn.Dropout(p=implicit_dropout_p) on custom activation_fn (for fc1_dropout) and after Tutel Moe-layer (for fc2_dropout) instead."
-
             experts['model_dim'] = self.model_dim
             experts['num_experts_per_device'] = self.num_local_experts
             experts['sharded_count'] = self.sharded_count
@@ -203,10 +196,11 @@ class MOELayer(torch.nn.Module):
             gate_type = {'type': 'top', 'k': top_k}
 
         if not isinstance(gate_type, list):
-            gate_type = [gate_type]
+            gate_type_list = [gate_type]
+        else:
+            gate_type_list = gate_type
 
-        # First, check for MoGE configuration from the first gate's config dict
-        first_gate_config = gate_type[0]
+        first_gate_config = gate_type_list[0]
         self.is_moge = first_gate_config.get('is_moge', False)
         
         if self.is_moge:
@@ -215,8 +209,6 @@ class MOELayer(torch.nn.Module):
                 raise ValueError("num_groups must be a positive integer for MoGE mode.")
             if self.num_global_experts % self.num_groups != 0:
                 raise ValueError(f"num_global_experts ({self.num_global_experts}) must be divisible by num_groups ({self.num_groups}).")
-            
-            # In MoGE mode, the gate's top_k is interpreted as k *per group*
             self.top_k_per_group = first_gate_config.get('k', 1)
             self.experts_per_group = self.num_global_experts // self.num_groups
             logging.info(f"Tutel MOELayer configured in MoGE mode with {self.num_groups} groups and top-{self.top_k_per_group} selection per group.")
@@ -225,26 +217,33 @@ class MOELayer(torch.nn.Module):
             self.top_k_per_group = 0
 
         self.gates = []
-        for gi, single_gate_type in enumerate(gate_type):
-            gate_type = single_gate_type.pop('type')
-            assert re.match(r'[a-zA-Z0-9\_]+', gate_type), "Gate type must only include digits, letters and underline characters."
+        for gi, single_gate_config in enumerate(gate_type_list):
+            gate_params = single_gate_config.copy()
+            
+            # Pop the custom keys so they are not passed to the gate constructor
+            gate_params.pop('is_moge', None)
+            gate_params.pop('num_groups', None)
+
+            gate_type_name = gate_params.pop('type')
+            assert re.match(r'[a-zA-Z0-9\_]+', gate_type_name), "Gate type must only include digits, letters and underline characters."
 
             if seeds is not None and seeds[0] is not None:
                 torch.manual_seed(seeds[0] + gi)
 
-            if gate_type == 'custom':
-                 single_gate = single_gate_type.pop('module')
+            if gate_type_name == 'custom':
+                 single_gate = gate_params.pop('module')
             else:
                 try:
-                    single_gate = importlib.import_module(f'...gates.{gate_type}', __name__).Gate
+                    single_gate = importlib.import_module(f'...gates.{gate_type_name}', __name__).Gate
                 except ModuleNotFoundError:
-                    raise Exception("Unrecognized gate_type: %s" % gate_type)
+                    raise Exception("Unrecognized gate_type: %s" % gate_type_name)
 
-            gate_module = single_gate(model_dim=self.model_dim, num_global_experts=self.num_global_experts, **single_gate_type)
+            gate_module = single_gate(model_dim=self.model_dim, num_global_experts=self.num_global_experts, **gate_params)
+            
             if not hasattr(gate_module, 'gate_noise'):
-                gate_module.gate_noise = single_gate_type.get('gate_noise', 0.0)
+                gate_module.gate_noise = single_gate_config.get('gate_noise', 0.0)
             if not hasattr(gate_module, 'capacity_factor'):
-                gate_module.capacity_factor = single_gate_type.get('capacity_factor', float(os.environ.get('CAP_FACTOR', 1.0)))
+                gate_module.capacity_factor = single_gate_config.get('capacity_factor', float(os.environ.get('CAP_FACTOR', 1.0)))
 
             self.gates += [gate_module]
 
